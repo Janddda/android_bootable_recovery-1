@@ -39,6 +39,7 @@
 #include "minui.h"
 #include "graphics.h"
 
+#include "cutils/properties.h"
 
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(x[0]))
@@ -53,6 +54,13 @@ static font_item gr_fonts[] = {
     { "menu", NULL },
     { "log", NULL },
 };
+
+typedef enum {
+    GROrientation_0 = 0,
+    GROrientation_90,
+    GROrientation_180,
+    GROrientation_270,
+} GROrientation;
 
 static GRFont* gr_font = NULL;
 static minui_backend* gr_backend = NULL;
@@ -69,6 +77,8 @@ static unsigned char gr_current_b = 255;
 static unsigned char gr_current_a = 255;
 
 static GRSurface* gr_draw = NULL;
+static GRSurface* gr_output = NULL;
+static GROrientation gr_orientation = GROrientation_0;
 
 static bool outside(int x, int y)
 {
@@ -454,8 +464,125 @@ static void gr_test() {
 }
 #endif
 
+static void gr_reverse_line_pixel_bpp_2(unsigned short *srcLine, unsigned short *dstLine, __u32 width) {
+    __u32 x;
+    unsigned short *src = srcLine + width - 1;
+    unsigned short *dst = dstLine;
+
+    for (x = 0; x < width; ++x) {
+        *dst++ = *src--;
+    }
+}
+
+static void gr_reverse_line_pixel_bpp_4(unsigned int *srcLine, unsigned int *dstLine, __u32 width) {
+    __u32 x;
+    unsigned int *src = srcLine + width - 1;
+    unsigned int *dst = dstLine;
+
+    for (x = 0; x < width; ++x) {
+        *dst++ = *src--;
+    }
+}
+
+static void gr_flip_output(GRSurface *srcSurface, GRSurface *dstSurface) {
+    __u32 x, y, width, height, bpp, pitch;
+    unsigned char *src = srcSurface->data + (srcSurface->height-1) * srcSurface->row_bytes;
+    unsigned char *dst = dstSurface->data;
+
+    width = dstSurface->width;
+    height = dstSurface->height;
+    bpp = dstSurface->pixel_bytes;
+    pitch = dstSurface->row_bytes;
+
+    if (bpp == 2) {
+        for (y = 0; y < height; ++y) {
+            gr_reverse_line_pixel_bpp_2((unsigned short*)src, (unsigned short*)dst, width);
+            src -= pitch;
+            dst += pitch;
+        }
+    }
+    else if (bpp == 4) {
+        for (y = 0; y < height; ++y) {
+            gr_reverse_line_pixel_bpp_4((unsigned int*)src, (unsigned int*)dst, width);
+            src -= pitch;
+            dst += pitch;
+        }
+    } else {
+        perror("unsupported bpp");
+    }
+}
+
 void gr_flip() {
-    gr_draw = gr_backend->flip(gr_backend);
+    if (gr_output != NULL) {
+        gr_flip_output(gr_draw, gr_output);
+        gr_output = gr_backend->flip(gr_backend);
+    } else {
+        gr_draw = gr_backend->flip(gr_backend);
+    }
+}
+
+static GROrientation gr_get_orientation(char *buf) {
+    switch (atoi(buf)) {
+    case 90:  return GROrientation_90;
+    case 180: return GROrientation_180;
+    case 270: return GROrientation_270;
+    default:  return GROrientation_0;
+    }
+}
+
+static void gr_alloc_staging_buffer()
+{
+    char value[PROPERTY_VALUE_MAX] = {0};
+    char buffer[20] = {0};
+    int  len;
+
+    len = property_get("persist.tegra.panel.rotation", value, NULL);
+
+    if (len > 0) {
+        /*
+         * persist.tegra.panel.rotation is
+         * debugging or engineering purpose only.
+         */
+        gr_orientation = gr_get_orientation(value);
+    } else if (len == 0) {
+        /*
+         * If property is empty,
+         * check sysfs node for panel rotation,
+         * which will be used in real detection.
+         */
+        int fd = open("/sys/class/graphics/fb0/device/panel_rotation", O_RDONLY);
+        if (fd < 0) {
+            perror("cannot open panel_rotation path\n");
+            gr_orientation = GROrientation_0;
+        } else {
+            read(fd, buffer, sizeof(buffer));
+            gr_orientation = gr_get_orientation(buffer);
+            close(fd);
+        }
+    } else {
+        gr_orientation = GROrientation_0;
+    }
+
+    // Allocate staging buffer for 180 degree, not figure out how to handle 90 and 270
+    // because the aspect ratio are different, and not sure yet how we plan to deal with
+    // that case
+    if (gr_orientation == GROrientation_180) {
+        GRSurface *staging = malloc(sizeof(GRSurface));
+
+        if (staging != NULL) {
+            staging->width = gr_draw->width;
+            staging->height = gr_draw->height;
+            staging->row_bytes = gr_draw->row_bytes;
+            staging->pixel_bytes = gr_draw->pixel_bytes;
+            staging->data = malloc(gr_draw->height * gr_draw->row_bytes);
+            if (staging->data == NULL) {
+                free(staging);
+            } else {
+                gr_output = gr_draw;
+                gr_draw = staging;
+            }
+        }
+    }
 }
 
 int gr_init(void)
@@ -488,6 +615,8 @@ int gr_init(void)
             return -1;
         }
     }
+
+    gr_alloc_staging_buffer();
 
     overscan_offset_x = gr_draw->width * overscan_percent / 100;
     overscan_offset_y = gr_draw->height * overscan_percent / 100;
